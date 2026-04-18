@@ -22,12 +22,19 @@ class ExecutionGuard:
         self,
         high_impact_tools: set[str] | None = None,
         high_impact_keywords: set[str] | None = None,
+        strict_mode: bool = False,
+        trusted_recipient_domains: set[str] | None = None,
     ) -> None:
         self.high_impact_tools = high_impact_tools or {"send_email", "delete_file", "send_money"}
         self.high_impact_keywords = high_impact_keywords or {"transfer", "wire"}
+        self.strict_mode = strict_mode
+        self.trusted_recipient_domains = {
+            domain.lower() for domain in (trusted_recipient_domains or {"bluesparrowtech.com"})
+        }
         self.current_query_snippets: set[str] = set()
         self.current_query_intents: set[str] = set()
         self.current_trusted_email: str | None = None
+        self.current_query_text: str = ""
 
     def set_query_context(
         self,
@@ -35,10 +42,12 @@ class ExecutionGuard:
         trusted_query_snippets: set[str] | None = None,
         trusted_query_intents: set[str] | None = None,
         trusted_email: str | None = None,
+        query_text: str | None = None,
     ) -> None:
         self.current_query_snippets = trusted_query_snippets or set()
         self.current_query_intents = trusted_query_intents or set()
         self.current_trusted_email = trusted_email
+        self.current_query_text = self._normalize(query_text or "")
 
     def should_block(
         self,
@@ -63,13 +72,27 @@ class ExecutionGuard:
                 self.current_trusted_email,
             )
 
+        if self.strict_mode and tool_name.lower() in {"delete_file", "delete_email"}:
+            if "confirm delete" not in self.current_query_text:
+                return (
+                    True,
+                    "Blocked by ExecutionGuard: destructive operation requires explicit confirmation phrase 'confirm delete'.",
+                )
+
         flat_values = self._flatten_argument_values(arguments)
+        risky_markers = {
+            snippet
+            for snippet in untrusted_snippets
+            if self.EMAIL_PATTERN.fullmatch(snippet) or len(snippet) >= 24
+        }
         for value in flat_values:
             normalized_value = self._normalize(value)
             if not normalized_value:
                 continue
-            for snippet in untrusted_snippets:
-                if snippet and snippet in normalized_value:
+            for snippet in risky_markers:
+                if snippet in trusted_query_snippets:
+                    continue
+                if snippet in normalized_value:
                     return (
                         True,
                         "Blocked by ExecutionGuard: high-impact tool arguments appear to originate "
@@ -86,6 +109,30 @@ class ExecutionGuard:
         trusted_email: str | None,
     ) -> tuple[bool, str]:
         normalized_recipients = [self._normalize(value) for value in self._flatten_argument_values(arguments.get("recipients"))]
+        if self.strict_mode:
+            for recipient in normalized_recipients:
+                if not recipient:
+                    continue
+                if trusted_email is not None and recipient == self._normalize(trusted_email):
+                    continue
+                domain = recipient.split("@")[-1] if "@" in recipient else ""
+                if domain not in self.trusted_recipient_domains:
+                    return (
+                        True,
+                        "Blocked by ExecutionGuard: emailing untrusted external recipients is not allowed in strict mode.",
+                    )
+
+            subject_and_body = self._flatten_argument_values(arguments.get("subject")) + self._flatten_argument_values(
+                arguments.get("body")
+            )
+            for text in subject_and_body:
+                normalized_text = self._normalize(text)
+                if "http://" in normalized_text or "https://" in normalized_text:
+                    return (
+                        True,
+                        "Blocked by ExecutionGuard: URL content in outgoing email is not allowed in strict mode.",
+                    )
+
         untrusted_emails = {
             snippet for snippet in untrusted_snippets if self.EMAIL_PATTERN.fullmatch(snippet)
         }
@@ -302,6 +349,7 @@ class ToolsExecutor(BasePipelineElement):
                 trusted_query_snippets=guard_state["trusted_query_snippets"],
                 trusted_query_intents=guard_state["trusted_query_intents"],
                 trusted_email=trusted_email,
+                query_text=query,
             )
             prior_tool_messages = [m for m in messages if m["role"] == "tool"]
             for message in prior_tool_messages:

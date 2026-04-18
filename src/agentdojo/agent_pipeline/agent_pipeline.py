@@ -316,9 +316,15 @@ class AgentPipeline(BasePipelineElement):
             pipeline.name = f"{llm_name}-{config.defense}"
             return pipeline
         if config.defense == "dual_guard":
+            strict_execution_guard = ExecutionGuard(
+                high_impact_tools={"send_email", "delete_file", "delete_email", "send_money"},
+                high_impact_keywords={"transfer", "wire"},
+                strict_mode=True,
+                trusted_recipient_domains={"bluesparrowtech.com"},
+            )
             tools_loop = ToolsExecutionLoop(
                 [
-                    ToolsExecutor(tool_output_formatter=tool_output_formatter, execution_guard=execution_guard),
+                    ToolsExecutor(tool_output_formatter=tool_output_formatter, execution_guard=strict_execution_guard),
                     llm,
                 ]
             )
